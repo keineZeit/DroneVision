@@ -8,6 +8,11 @@ using namespace cv;
 
 constexpr auto OPENCV_INSTALL_PATH = "C:\\opencv\\opencv-4.1.1\\build\\install\\";
 
+void cudaBlobFromImage(InputArray image, OutputArray blob, double scalefactor,
+	const Size& size, const Scalar& mean, bool swapRB, bool crop, int ddepth);
+void cudaBlobFromImages(InputArrayOfArrays images_, OutputArray blob_, double scalefactor,
+	Size size, const Scalar& mean_, bool swapRB, bool crop, int ddepth);
+
 // --- HAAR FACE DETECTOR --------------------------------------------------------------------------
 
 HaarFaceDetector::HaarFaceDetector(string _modelName, float _threshold = 0.7) {
@@ -67,7 +72,8 @@ Mat YoloObjectDetector::predict(Mat inputFrame) {
 		return inputFrame;
 	}
 
-	blobFromImage(inputFrame, blob, 1 / 255.0, Size(416, 416), Scalar(0, 0, 0), true, false);
+	cudaBlobFromImage(inputFrame, blob, 1 / 255.0, Size(416, 416), Scalar(0, 0, 0), true, false, 5);
+	//blobFromImage(inputFrame, blob, 1 / 255.0, Size(416, 416), Scalar(0, 0, 0), true, false);
 	this->model.setInput(blob);
 
 	// Runs the forward pass to get output of the output layers
@@ -181,3 +187,119 @@ void YoloObjectDetector::drawPredictions(int classId, float conf, int left, int 
 }
 
 YoloObjectDetector::~YoloObjectDetector() {}
+
+
+
+
+
+
+void cudaBlobFromImage(InputArray image, OutputArray blob, double scalefactor,
+	const Size& size, const Scalar& mean, bool swapRB, bool crop, int ddepth)
+{
+	std::vector<Mat> images(1, image.getMat());
+	cudaBlobFromImages(images, blob, scalefactor, size, mean, swapRB, crop, ddepth);
+}
+
+void cudaBlobFromImages(InputArrayOfArrays images_, OutputArray blob_, double scalefactor,
+	Size size, const Scalar& mean_, bool swapRB, bool crop, int ddepth)
+{
+	CV_CheckType(ddepth, ddepth == CV_32F || ddepth == CV_8U, "Blob depth should be CV_32F or CV_8U");
+	if (ddepth == CV_8U)
+	{
+		CV_CheckEQ(scalefactor, 1.0, "Scaling is not supported for CV_8U blob depth");
+		CV_Assert(mean_ == Scalar() && "Mean subtraction is not supported for CV_8U blob depth");
+	}
+
+	std::vector<Mat> images;
+	images_.getMatVector(images);
+	CV_Assert(!images.empty());
+	for (size_t i = 0; i < images.size(); i++)
+	{
+		cuda::GpuMat d_image, d_resized_image, d_converted_image;
+		d_image.upload(images[i]);
+
+		Size imgSize = images[i].size();
+		if (size == Size())
+			size = imgSize;
+		if (size != imgSize)
+		{
+			if (crop)
+			{
+				float resizeFactor = std::max(size.width / (float)imgSize.width,
+					size.height / (float)imgSize.height);
+				//resize(images[i], images[i], Size(), resizeFactor, resizeFactor, INTER_LINEAR);
+				cuda::resize(d_image, d_resized_image, Size(), resizeFactor, resizeFactor, INTER_LINEAR);
+				d_resized_image.download(images[i]);
+				Rect crop(Point(0.5 * (images[i].cols - size.width),
+					0.5 * (images[i].rows - size.height)),
+					size);
+				images[i] = images[i](crop);
+			}
+			else {
+				//resize(images[i], images[i], size, 0, 0, INTER_LINEAR);
+				cuda::resize(d_image, d_resized_image, size, 0, 0, INTER_LINEAR);
+				d_resized_image.download(images[i]);
+			}
+		}
+
+		if (images[i].depth() == CV_8U && ddepth == CV_32F) {
+			d_image.upload(images[i]);
+			d_image.convertTo(d_converted_image, CV_32F);
+			d_converted_image.download(images[i]);
+			//images[i].convertTo(images[i], CV_32F);
+		}
+		Scalar mean = mean_;
+		if (swapRB) {
+			swap(mean[0], mean[2]);
+		}
+
+		images[i] -= mean;
+		images[i] *= scalefactor;
+	}
+
+	size_t nimages = images.size();
+	Mat image0 = images[0];
+	int nch = image0.channels();
+	CV_Assert(image0.dims == 2);
+
+	if (nch == 3 || nch == 4)
+	{
+		int sz[] = { (int)nimages, nch, image0.rows, image0.cols };
+		blob_.create(4, sz, ddepth);
+		Mat blob = blob_.getMat();
+		Mat ch[4];
+
+		for (size_t i = 0; i < nimages; i++)
+		{
+			const Mat& image = images[i];
+			CV_Assert(image.depth() == blob_.depth());
+			nch = image.channels();
+			CV_Assert(image.dims == 2 && (nch == 3 || nch == 4));
+			CV_Assert(image.size() == image0.size());
+
+			for (int j = 0; j < nch; j++)
+				ch[j] = Mat(image.rows, image.cols, ddepth, blob.ptr((int)i, j));
+			if (swapRB)
+				std::swap(ch[0], ch[2]);
+			split(image, ch);
+		}
+	}
+	else
+	{
+		CV_Assert(nch == 1);
+		int sz[] = { (int)nimages, 1, image0.rows, image0.cols };
+		blob_.create(4, sz, ddepth);
+		Mat blob = blob_.getMat();
+
+		for (size_t i = 0; i < nimages; i++)
+		{
+			const Mat& image = images[i];
+			CV_Assert(image.depth() == blob_.depth());
+			nch = image.channels();
+			CV_Assert(image.dims == 2 && (nch == 1));
+			CV_Assert(image.size() == image0.size());
+
+			image.copyTo(Mat(image.rows, image.cols, ddepth, blob.ptr((int)i, 0)));
+		}
+	}
+}
